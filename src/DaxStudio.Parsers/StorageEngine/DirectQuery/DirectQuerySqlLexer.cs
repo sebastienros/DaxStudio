@@ -42,7 +42,11 @@ namespace DaxStudio.Parsers.StorageEngine.DirectQuery
         public static readonly Parser<TextSpan> StringLiteralToken = Literals.Scan(StringLiteral, "'".AsSpan());
 
         /// <summary>The text the lexer skips, see <see cref="Trivia(ReadOnlySpan{char})"/>.</summary>
-        public static readonly Parser<TextSpan> TriviaToken = Literals.Scan(Trivia);
+        /// <remarks>
+        /// It can start with any char that doesn't start a token, and with the tokens that can fail, so that the context doesn't
+        /// invoke it before the others: identifiers, numbers and punctuation.
+        /// </remarks>
+        public static readonly Parser<TextSpan> TriviaToken = Literals.Scan(Trivia, TriviaStartChars().AsSpan());
 
         // The tokens up to the end of the text, or one char where there is none.
         private static readonly Parser<IReadOnlyList<TextSpan>> Tokens = ZeroOrMany(SkipWhiteSpace(
@@ -53,6 +57,19 @@ namespace DaxStudio.Parsers.StorageEngine.DirectQuery
             .WithWhiteSpaceParser(TriviaToken);
 
         private static bool IsDigit(char c) => c >= '0' && c <= '9';
+
+        // Every char but the ones that start a token which can't fail. The chars above ASCII are listed one by one: the
+        // white space parser of a context doesn't read OneOf.NonAsciiSeekableChar.
+        private static string TriviaStartChars()
+        {
+            var chars = new StringBuilder(char.MaxValue);
+            for (var c = 1; c <= char.MaxValue; c++)
+            {
+                if (!StartsToken((char)c)) chars.Append((char)c);
+            }
+
+            return chars.ToString();
+        }
 
         private static bool IsIdentifierStart(char c) => IdentifierStart.IndexOf(c) >= 0;
 
