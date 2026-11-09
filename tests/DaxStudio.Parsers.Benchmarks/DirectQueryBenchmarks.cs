@@ -1,4 +1,5 @@
 using DaxStudio.Parsers.StorageEngine;
+using DaxStudio.Parsers.StorageEngine.DirectQuery;
 using BenchmarkDotNet.Attributes;
 using System;
 using System.IO;
@@ -36,6 +37,19 @@ namespace DaxStudio.Parsers.Benchmarks
 
         [Benchmark]
         public int Parlot() => Run(_parlot);
+
+        /// <summary>Parses the statements into trees, without analysing them.</summary>
+        [Benchmark]
+        public int ParlotParseOnly()
+        {
+            var count = 0;
+            foreach (var query in _queries)
+            {
+                if (DirectQuerySqlGrammar.Parse(query, out _) != null) count++;
+            }
+
+            return count;
+        }
 
         private int Run(IXmSqlParser parser)
         {
