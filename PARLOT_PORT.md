@@ -23,9 +23,9 @@ oracle that the tests compare Parlot against.
 | Benchmarks | `tests/DaxStudio.Parsers.Benchmarks` (BenchmarkDotNet, net8.0 and net10.0) |
 
 The Parlot package is the only new dependency of `DaxStudio.Parsers`, which stays C# 8 and still targets
-net472. The branch uses `2.2.1` from nuget.org.
+net472. The branch uses `2.3.0` from nuget.org.
 
-### What Parlot 2.2.1 is used for
+### What Parlot is used for
 
 - **Non-fatal errors.** Text the grammar skips is reported as a Parlot diagnostic (`.Warning(...)`), and
   `XmSqlQuery.Diagnostics` exposes them, with `HasErrors`/`ErrorOffset` derived from it. Two places skip text:
@@ -36,14 +36,18 @@ net472. The branch uses `2.2.1` from nuget.org.
   `CollectDiagnostics` only when it actually skipped something. Valid input pays nothing.
 - **Keywords.** `Keyword(text, identifierPart)` with letters, digits and `_` as the identifier part, so that
   `COUNT` doesn't match in `COUNT_BIG` (this already existed in 2.1.0).
-- **`Operators()`** is not used. It can't copy the ANTLR DirectQuery grammar, whose `IS [NOT] NULL` is a postfix
-  looser than `AND`/`OR` that ANTLR's left-recursive rule still lets `OR ...` follow. A precedence table rightly
-  can't: that ordering is a bug of the ANTLR grammar, which the Parlot grammar now fixes (see
-  [below](#a-bug-of-the-antlr-directquery-grammar-fixed-here)). With the T-SQL precedences a table would fit, but the
-  DirectQuery grammar reads each expression as a flat chain anyway, to split a join condition at its last `=` as
-  ANTLR does, and keeps its own small precedence climber over that chain. Valued levels (a factory that
-  receives the operator, such as `IS NOT NULL` against `IS NULL`) would have covered the rest. The xmSQL `expression`
-  rule is a flat `atom (op atom)*` list with no precedence, so it has no use for a table either.
+- **`Operators()`** reads the DirectQuery expressions, with the T-SQL precedences. It can't copy the ANTLR grammar,
+  whose `IS [NOT] NULL` is a postfix looser than `AND`/`OR` that ANTLR's left-recursive rule still lets `OR ...` follow:
+  that ordering is a bug of the ANTLR grammar, which the Parlot grammar fixes (see
+  [below](#a-bug-of-the-antlr-directquery-grammar-fixed-here)). The table has two levels of `*` `/` `%` and `+` `-`,
+  then a postfix level for the comparisons and `IS [NOT] NULL`, which bind alike and apply in any order, then `AND` and
+  `OR`. The postfix operators are valued (2.3.0): a comparison carries its right operand, and the level also applies
+  `+` `-` `*` `/` `%` with theirs, as these can follow `IS NULL`. `NOT` can follow any operator and reads a comparison,
+  so it is an operand rather than a prefix level, whose operand would be tighter. The join conditions are still read
+  as a flat chain, to split them at their last `=` as ANTLR does, with a small precedence climber over that chain. The
+  table and the chain give the same tree for all 86 corpus statements and 20,000 generated expressions mixing every
+  operator, `NOT` and `IS NULL`, and it allocates 30% less than the chain did for every expression. The xmSQL
+  `expression` rule is a flat `atom (op atom)*` list with no precedence, so it has no use for a table.
 - **Bounded recursion**. Input nested too deeply for the thread's stack now fails the parse with a
   `ParseException` instead of overflowing the stack, which ended the process. The entry points catch it and return
   their fallback values (null text, a failed analysis). About 700 nested parentheses parse on a 1 MB stack, the
@@ -57,9 +61,13 @@ net472. The branch uses `2.2.1` from nuget.org.
   footers and lookaheads from `WhenNotFollowedBy`, `Deferred` and `Eof`. Four things stay scanned by hand: xmSQL
   `BRACKETED_NAME`, a longest match over an ambiguous rule; `NUMBER`, because a chain of captures made the 1,000-number
   lists 86% slower to parse against 10% for all the changes with the scanner; and the DirectQuery trivia with the two
-  tokens it needs, as it skips the tokens the lexer fails to read.
+  tokens it needs, as it skips the tokens the lexer fails to read. The trivia scanner tells the chars it can start
+  with, every char but the ones that start a token which can't fail, so that the context doesn't invoke it before
+  identifiers, numbers and punctuation (2.3.0).
 - **`WithComments`** skips xmSQL's `/* */` comments, with a comment parser of its own since `WithMultiLine` fails the
   parse when a comment doesn't close. It only runs on text containing `/*`, so queries without comments don't pay for it.
+  The single `CommentsParser` of 2.3.0 isn't used for the same reason: a parser added with `WithParser()` makes the
+  builder fall back to its choice of parsers in a loop.
 - **Pooled strings** (`ToPooledString()`) were tried for the table and column names, which the analysis and
   grouping walkers turn into strings (one `Substring` per reference). The AST took them as pooled strings, and the
   walkers read them. Allocations dropped by 335 KB per server timings batch for analysis and 268 KB for grouping
@@ -68,6 +76,43 @@ net472. The branch uses `2.2.1` from nuget.org.
   formatter pays it for names it doesn't need, so the AST keeps text spans. The analysis results dedupe the names
   in their own dictionaries, so pooling wouldn't shrink what they keep either.
 - **`Ternary`** has no use: neither grammar has a conditional operator (`CASE` is only a DirectQuery token).
+
+### Parlot 2.3.0
+
+Moving from 2.2.1 to 2.3.0 changed no output (`--check` is identical and the tests pass unchanged), then two of its
+features improved the DirectQuery grammar. The others don't apply:
+
+- `Longest`: the lexer rules whose longest match isn't the first one are xmSQL `BRACKETED_NAME`, ambiguous inside its
+  loop rather than between alternatives, and DirectQuery `STRING_LITERAL`, which the trivia scanner also needs. The token
+  choices are ordered so that the first match is the longest.
+- `String()` with `StringEscapes.Sql` reads `'it''s'`, but `'a''` fails it, while the ANTLR lexer reads `'a'` and then
+  `'`. The DirectQuery scanner keeps the longest match.
+- `Identifier` code points and the keyword ranges: both grammars have ASCII identifiers.
+- `NoNewLineBefore`/`NewLineAhead`, `Scan(TextScanner)`, `Peek`, `ThenTry`, `WithState`, `Separated` with an empty
+  first value, `Ternary` and the furthest failure: nothing in the grammars depends on lines, on the text before a token or
+  on a state, and `WhenNotFollowedBy` and `When` already cover the lookaheads and conversions.
+- The changes that move positions (`Between`, `Not`, the start of sequences) change no output: the formatted text,
+  analysis and differential tests and `--check` give the same results.
+
+Each row is two alternating runs of one in-process pass on net8.0 (`--warmupCount 6 --iterationCount 8 --iterationTime
+120`, and 10/20 iterations for DirectQuery), against the build before the change. Changes of a few percent are noise;
+the allocations are exact.
+
+| Change | Benchmark | Before | After | Change |
+|---|---|---:|---:|---:|
+| 2.2.1 to 2.3.0 | Parse Corpus | 169.4 μs | 177.4 μs | +5% |
+| | Parse LongInLists | 585.1 μs | 594.4 μs | +2% |
+| | Parse ServerTimings | 2,170.7 μs | 2,288.1 μs | +5% |
+| | Format Corpus / LongInLists / ServerTimings | 401 / 1,829 / 5,995 μs | 379 / 1,769 / 5,985 μs | -6% / -3% / 0% |
+| | DirectQuery analysis | 459.2 μs | 389.3 μs | -15% (noisy) |
+| Trivia start chars | DirectQuery parse only | 198.1 μs | 168.9 μs | -15% |
+| | DirectQuery analysis | 311.0 μs | 294.2 μs | none visible |
+| Operator table | DirectQuery parse only | 174.2 μs, 217.3 KB | 168.5 μs, 151.65 KB | none visible, -30% |
+| | DirectQuery analysis | 294.7 μs, 423.04 KB | 280.8 μs, 357.39 KB | none visible, -16% |
+
+The 2.3.0 parse of xmSQL looks about 5% slower in both runs, while formatting, which includes the parse, isn't; no
+allocation changed. The xmSQL grammar doesn't use a custom white space parser, so the start chars that sped up the
+DirectQuery trivia don't apply to it.
 
 A 2.2.0 preview alone also made the parse faster and lighter than 2.1.0 with no grammar change (server timings,
 net8.0: 1,749 µs and 1,907 KB before; 1,630 µs and 1,836 KB in an A/B run on the same machine; LongInLists
@@ -238,14 +283,19 @@ afterwards, so its allocations didn't change.
 
 ### DirectQuery SQL analysis (86 statements, 28 KB)
 
+With Parlot 2.3.0, the trivia start chars and the operator table, in process with the same job as the tables above.
+`ParlotParseOnly` parses the statements without analysing them.
+
 | Runtime | Method | Mean | Ratio | Allocated | Alloc Ratio |
 |---|---|---:|---:|---:|---:|
-| net10.0 | Regex | 7,404.8 μs | 1.11 | 11750.34 KB | 1.01 |
-| net10.0 | Antlr | 1,896.9 μs | 0.28 | 4870.8 KB | 0.42 |
-| net10.0 | Parlot | 203.5 μs | 0.03 | 408.02 KB | 0.04 |
-| net8.0 | Regex | 6,681.0 μs | 1.00 | 11608.86 KB | 1.00 |
-| net8.0 | Antlr | 2,496.9 μs | 0.37 | 5026.41 KB | 0.43 |
-| net8.0 | Parlot | 230.1 μs | 0.03 | 412.01 KB | 0.04 |
+| net10.0 | Regex | 6,901.2 μs | 0.92 | 11749.84 KB | 1.01 |
+| net10.0 | Antlr | 2,096.7 μs | 0.28 | 4870.84 KB | 0.42 |
+| net10.0 | Parlot | 217.7 μs | 0.03 | 352.44 KB | 0.03 |
+| net10.0 | ParlotParseOnly | 134.1 μs | 0.02 | 150.81 KB | 0.01 |
+| net8.0 | Regex | 7,528.2 μs | 1.00 | 11608.85 KB | 1.00 |
+| net8.0 | Antlr | 2,503.9 μs | 0.33 | 5026.42 KB | 0.43 |
+| net8.0 | Parlot | 266.5 μs | 0.04 | 357.39 KB | 0.03 |
+| net8.0 | ParlotParseOnly | 162.3 μs | 0.02 | 151.65 KB | 0.01 |
 
 ### Parsing only (no tree walk; the regex parser has no separate parse step)
 
@@ -285,7 +335,7 @@ stand out. Allocations only change for DirectQuery.
 | Format | Corpus | 323.7 μs | 325.3 μs | none visible |
 | Format | LongInLists | 1,683.3 μs | 1,643.1 μs | none visible |
 | Format | ServerTimings | 5,308.4 μs | 5,185.0 μs | none visible |
-| DirectQuery analysis | | 223.3 μs, 412.01 KB | 246.9 μs, 423.04 KB | +11%, +11 KB |
+| DirectQuery analysis | | 223.3 μs, 412.01 KB | 246.9 μs, 423.04 KB | +11%, +11 KB (-66 KB since, see [Parlot 2.3.0](#parlot-230)) |
 
 The formatting walker skips the name-cleaning regexes when a name can't match them (no `(`, `-`, `<`,
 `RowNumber`), which accounts for part of the formatting gain over ANTLR. That is a separate commit
@@ -302,6 +352,9 @@ net8.0, and on net472 after changing its target framework locally.
 The 5 `DaxStudio.Parsers.Tests` that fail on macOS, on `develop` as well, pass on Windows
 (`RdlCustomParameterWithScriptParameter`, `RdlCustomParameterWithScriptParameter2`, `ParameterArrayAndQueryTest`,
 `ParameterArrayWithUnquotedValuesAndQueryTest`, `ConnectPbixWithFullPathTest`).
+
+The commits since (Parlot 2.3.0, the DirectQuery trivia start chars and operator table) have not been run on Windows:
+the test machine wasn't reachable. Rerun the test projects on Windows for them.
 
 `build.cmd`, the `DaxStudio.ExcelAddin` build and the application itself were not run. Launch the application against
 a real trace before merging, to try Server Timings and the xmSQL views.
