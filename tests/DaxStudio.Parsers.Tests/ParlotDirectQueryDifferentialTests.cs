@@ -123,6 +123,9 @@ namespace DaxStudio.Parsers.Tests
         [DataRow("NOT [t1].[a] = 1 OR [t1].[b] = 2", "(NOT(([t1].[a] = 1)) OR ([t1].[b] = 2))")]
         [DataRow("NOT [t1].[a] IS NULL AND [t1].[b] = 2", "(NOT(([t1].[a] IS NULL)) AND ([t1].[b] = 2))")]
         [DataRow("[t1].[a] = 1 OR [t1].[b] = 2 AND [t1].[c] = 3", "(([t1].[a] = 1) OR (([t1].[b] = 2) AND ([t1].[c] = 3)))")]
+        [DataRow("[t1].[a] + NOT [t1].[b] = 1", "([t1].[a] + NOT(([t1].[b] = 1)))")]
+        [DataRow("[t1].[a] IS NULL + 1 = 2", "((([t1].[a] IS NULL) + 1) = 2)")]
+        [DataRow("[t1].[a] IS NULL * 2 + 1", "((([t1].[a] IS NULL) * 2) + 1)")]
         public void ExpressionsUseTSqlPrecedence(string where, string expected)
         {
             var statement = DirectQuerySqlGrammar.Parse("SELECT [t1].[a] AS [c1] FROM [dbo].[A] AS [t1] WHERE " + where);

@@ -17,9 +17,10 @@ namespace DaxStudio.Parsers.StorageEngine.DirectQuery
     /// </para>
     /// <list type="bullet">
     /// <item>
-    /// An expression is read as a flat chain of operands and operators, then turned into a tree with the
-    /// T-SQL precedences (* / % 8, + - 7, comparisons and IS NULL 6, NOT 6 for its operand, AND 5, OR 4). The ANTLR
-    /// rule gives IS NULL and NOT the lowest precedence instead, which this grammar deliberately doesn't copy. In <c>joinCondition : expression EQUALS expression</c>, the first
+    /// An expression is read with an operator table, with the T-SQL precedences (* / % 8, + - 7, comparisons and
+    /// IS NULL 6, NOT 6 for its operand, AND 5, OR 4). The ANTLR rule gives IS NULL and NOT the lowest precedence
+    /// instead, which this grammar deliberately doesn't copy. The join conditions are read as a flat chain of operands
+    /// and operators, then turned into trees with the same precedences. In <c>joinCondition : expression EQUALS expression</c>, the first
     /// expression would otherwise take the '=' and the second expression any following <c>AND joinCondition</c>;
     /// ANTLR's greedy expression loops make the first expression end before the last '=' of the chain, so the
     /// chain is split there (and <c>(AND joinCondition)*</c> is never entered).
@@ -60,13 +61,17 @@ namespace DaxStudio.Parsers.StorageEngine.DirectQuery
             var comparisonOp = SkipWhiteSpace(Capture(Literals.Text("<>").Or(Literals.Text("!=")).Or(Literals.Text(">="))
                 .Or(Literals.Text("<=")).Or(Literals.Text("=")).Or(Literals.Text(">")).Or(Literals.Text("<"))));
 
+            var multiplicativeOp = SkipWhiteSpace(Capture(Literals.Char('*').Or(Literals.Char('/')).Or(Literals.Char('%'))));
+            var additiveOp = SkipWhiteSpace(Capture(Literals.Char('+').Or(minus)));
+            var andOp = Keyword("AND");
+            var orOp = Keyword("OR");
+
             var binaryOperator =
-                SkipWhiteSpace(Capture(Literals.Char('*').Or(Literals.Char('/')).Or(Literals.Char('%'))))
-                    .Then(t => (DqOperatorKind.Multiplicative, t))
-                .Or(SkipWhiteSpace(Capture(Literals.Char('+').Or(minus))).Then(t => (DqOperatorKind.Additive, t)))
+                multiplicativeOp.Then(t => (DqOperatorKind.Multiplicative, t))
+                .Or(additiveOp.Then(t => (DqOperatorKind.Additive, t)))
                 .Or(comparisonOp.Then(t => (DqOperatorKind.Comparison, t)))
-                .Or(Keyword("AND").Then(t => (DqOperatorKind.And, t)))
-                .Or(Keyword("OR").Then(t => (DqOperatorKind.Or, t)));
+                .Or(andOp.Then(t => (DqOperatorKind.And, t)))
+                .Or(orOp.Then(t => (DqOperatorKind.Or, t)));
 
             var isNull = Kw("IS").SkipAnd(Kw("NOT").Optional()).AndSkip(Kw("NULL")).Then(n => n.HasValue);
 
@@ -75,15 +80,42 @@ namespace DaxStudio.Parsers.StorageEngine.DirectQuery
             var nestedSelect = Deferred<DqSelectStatement>();
             var primary = Deferred<DqExpression>();
 
-            // NOT* primary ((binaryOperator NOT* primary) | IS NOT? NULL)*. An operator that is not followed by an operand
-            // ends the chain before it, as ANTLR leaves the expression loop when it cannot continue.
+            // NOT* primary ((binaryOperator NOT* primary) | IS NOT? NULL)*, read as a flat chain for the join conditions,
+            // see SplitJoinCondition. An operator that is not followed by an operand ends the chain before it, as ANTLR leaves
+            // the expression loop when it cannot continue.
             var operand = ZeroOrMany(Kw("NOT")).And(primary);
             var chain = operand.And(ZeroOrMany(
                 binaryOperator.And(operand).Then(x => new ChainTail { Operator = x.Item1.Item1, OperatorText = x.Item1.Item2, Nots = x.Item2.Item1.Count, Operand = x.Item2.Item2 })
                 .Or(isNull.Then(n => new ChainTail { IsNull = true, IsNot = n }))))
                 .Then(BuildChain);
 
-            var expression = chain.Then(c => BuildExpression(c, 0, c.Count));
+            // The other expressions, with the precedences of BuildExpression. A comparison and IS NULL bind alike and apply
+            // in any order, as the operators of a postfix level, the comparison with its right operand. Arithmetic can follow
+            // IS NULL, as in the chain, so that level also applies its operators with their right operand. NOT can follow any
+            // operator, and reads a comparison: it is an operand rather than a prefix level, whose operand would be tighter.
+            var comparison = Deferred<DqExpression>();
+            var notOperand = primary.Or(Kw("NOT").SkipAnd(comparison).Then(x => new DqExpression { Kind = DqExpressionKind.Not, Left = x }));
+
+            var multiplicative = notOperand.Operators()
+                .LeftAssociative(new[] { multiplicativeOp }, (a, b, op) => Binary(DqOperatorKind.Multiplicative, a, b, op));
+
+            var additive = multiplicative.Operators()
+                .LeftAssociative(new[] { additiveOp }, (a, b, op) => Binary(DqOperatorKind.Additive, a, b, op));
+
+            var suffix =
+                comparisonOp.And(additive).Then(x => new Suffix { Operator = DqOperatorKind.Comparison, OperatorText = x.Item1, Right = x.Item2 })
+                .Or(isNull.Then(isNot => new Suffix { IsNull = true, IsNot = isNot }))
+                .Or(additiveOp.And(multiplicative).Then(x => new Suffix { Operator = DqOperatorKind.Additive, OperatorText = x.Item1, Right = x.Item2 }))
+                .Or(multiplicativeOp.And(notOperand).Then(x => new Suffix { Operator = DqOperatorKind.Multiplicative, OperatorText = x.Item1, Right = x.Item2 }));
+
+            comparison.Parser = additive.Operators()
+                .Postfix((suffix, (x, s) => s.IsNull
+                    ? new DqExpression { Kind = DqExpressionKind.IsNull, Left = x, IsNot = s.IsNot }
+                    : Binary(s.Operator, x, s.Right, s.OperatorText)));
+
+            var expression = comparison.Operators()
+                .LeftAssociative(new[] { andOp }, (a, b, op) => Binary(DqOperatorKind.And, a, b, op))
+                .LeftAssociative(new[] { orOp }, (a, b, op) => Binary(DqOperatorKind.Or, a, b, op));
 
             var functionName = identifier
                 .Or(Keyword("SUM")).Or(Keyword("COUNT_BIG")).Or(Keyword("COUNT")).Or(Keyword("MIN")).Or(Keyword("MAX")).Or(Keyword("AVG"))
@@ -209,6 +241,9 @@ namespace DaxStudio.Parsers.StorageEngine.DirectQuery
         private static Parser<string> Kw(string keyword)
             => Terms.Keyword(keyword, DirectQuerySqlLexer.IdentifierPart, caseInsensitive: true);
 
+        private static DqExpression Binary(DqOperatorKind kind, DqExpression left, DqExpression right, TextSpan text)
+            => new DqExpression { Kind = DqExpressionKind.Binary, Left = left, Right = right, Operator = kind, OperatorText = text };
+
         /// <summary>A case-insensitive keyword, returning the text as written.</summary>
         private static Parser<TextSpan> Keyword(string keyword)
             => SkipWhiteSpace(Capture(Literals.Keyword(keyword, DirectQuerySqlLexer.IdentifierPart, caseInsensitive: true)));
@@ -232,6 +267,16 @@ namespace DaxStudio.Parsers.StorageEngine.DirectQuery
             public TextSpan OperatorText;
             public int Nots;
             public DqExpression Operand;
+        }
+
+        /// <summary>An operator of the postfix level of the expressions, with its right operand, or IS NULL.</summary>
+        private struct Suffix
+        {
+            public bool IsNull;
+            public bool IsNot;
+            public DqOperatorKind Operator;
+            public TextSpan OperatorText;
+            public DqExpression Right;
         }
 
         /// <summary>An element of an expression read as a flat chain.</summary>
